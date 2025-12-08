@@ -1396,7 +1396,22 @@ static ssize_t debugfs_mipi_command_write(struct file *file,
 		}
 	}
 
-	rc = mipi_dsi_device_transfer(dsi, dsi_msg);
+	if (!dsi->host->ops || !dsi->host->ops->transfer) {
+		rc = -ENOSYS;
+		goto error_two;
+	}
+
+	if (dsi->mode_flags & MIPI_DSI_MODE_LPM)
+		dsi_msg->flags |= MIPI_DSI_MSG_USE_LPM;
+
+	if ((command->command_buf[1] != 0x0F) || (dsi_msg->rx_len > 0)) {
+		// normal "slow" mode
+		dsi_msg->flags |= MIPI_DSI_MSG_LASTCOMMAND;
+	} else {
+		pr_debug("fast tx only command\n");
+	}
+
+	rc = dsi_host_transfer(dsi->host, dsi_msg);
 	if(!IS_ERR_VALUE(rc)){
 		rc = user_len;
 		pr_debug("wrote %d bytes\n", rc);

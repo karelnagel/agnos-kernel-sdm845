@@ -681,4 +681,6 @@ int dsi_display_cont_splash_config(void *display);
 int dsi_display_get_panel_vfp(void *display,
 	int h_active, int v_active);
 
+static ssize_t dsi_host_transfer(struct mipi_dsi_host *host, const struct mipi_dsi_msg *msg);
+
 #endif /* _DSI_DISPLAY_H_ */
