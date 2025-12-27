@@ -1,0 +1,152 @@
+name: Build AGNOS Kernel
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., 15.1-bluetooth)'
+        required: true
+        default: '15.1-bluetooth'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          path: agnos-kernel-sdm845
+
+      - name: Checkout agnos-builder
+        uses: actions/checkout@v4
+        with:
+          repository: commaai/agnos-builder
+          path: agnos-builder
+          lfs: true
+
+      - name: Set up build environment
+        run: |
+          cd agnos-builder
+          # Remove the submodule reference and use our kernel instead
+          rm -rf agnos-kernel-sdm845
+          ln -s ../agnos-kernel-sdm845 agnos-kernel-sdm845
+
+      - name: Extract tools
+        run: |
+          cd agnos-builder/tools
+          tar -xzf aarch64-linux-gnu-gcc.tar.gz
+
+      - name: Build kernel
+        run: |
+          cd agnos-builder
+
+          # Build Docker image
+          docker build -f Dockerfile.builder -t agnos-meta-builder . \
+            --build-arg UNAME=$(id -nu) \
+            --build-arg UID=$(id -u) \
+            --build-arg GID=$(id -g)
+
+          # Start container
+          CONTAINER_ID=$(docker run -d -v $(pwd):$(pwd) -w $(pwd) agnos-meta-builder)
+
+          # Build kernel in container
+          docker exec -u $(id -nu) $CONTAINER_ID bash -c '
+            set -e
+            cd agnos-kernel-sdm845
+
+            export ARCH=arm64
+            export CROSS_COMPILE=$(pwd)/../tools/aarch64-linux-gnu-gcc/bin/aarch64-linux-gnu-
+            export CC=$(pwd)/../tools/aarch64-linux-gnu-gcc/bin/aarch64-linux-gnu-gcc
+            export LD=$(pwd)/../tools/aarch64-linux-gnu-gcc/bin/aarch64-linux-gnu-ld.bfd
+            export KBUILD_BUILD_HOST="github-actions"
+            export KCFLAGS="-w"
+
+            make tici_defconfig O=out
+            make -j$(nproc --all) O=out
+          '
+
+          # Stop container
+          docker stop $CONTAINER_ID
+          docker rm $CONTAINER_ID
+
+      - name: Create boot image
+        run: |
+          cd agnos-builder
+          mkdir -p output
+          TMP_DIR=$(mktemp -d)
+
+          cp agnos-kernel-sdm845/out/arch/arm64/boot/Image.gz-dtb $TMP_DIR/
+
+          # Make boot image
+          ./tools/mkbootimg \
+            --kernel $TMP_DIR/Image.gz-dtb \
+            --ramdisk /dev/null \
+            --cmdline "console=ttyMSM0,115200n8 isolcpus=6,7 quiet loglevel=3 earlycon=msm_geni_serial,0xA84000 androidboot.hardware=qcom androidboot.console=ttyMSM0 ehci-hcd.park=3 lpm_levels.sleep_disabled=1 service_locator.enable=1 androidboot.selinux=permissive firmware_class.path=/lib/firmware/updates net.ifnames=0 dyndbg=\"\"" \
+            --pagesize 4096 \
+            --base 0x80000000 \
+            --kernel_offset 0x8000 \
+            --ramdisk_offset 0x8000 \
+            --tags_offset 0x100 \
+            --output $TMP_DIR/boot.img.nonsecure
+
+          # Sign boot image
+          openssl dgst -sha256 -binary $TMP_DIR/boot.img.nonsecure > $TMP_DIR/boot.img.sha256
+          openssl pkeyutl -sign -in $TMP_DIR/boot.img.sha256 -inkey vble-qti.key -out $TMP_DIR/boot.img.sig -pkeyopt digest:sha256 -pkeyopt rsa_padding_mode:pkcs1
+          dd if=/dev/zero of=$TMP_DIR/boot.img.sig.padded bs=2048 count=1
+          dd if=$TMP_DIR/boot.img.sig of=$TMP_DIR/boot.img.sig.padded conv=notrunc
+          cat $TMP_DIR/boot.img.nonsecure $TMP_DIR/boot.img.sig.padded > output/boot.img
+
+          # Compress
+          xz -9 -k output/boot.img
+
+          # Calculate hashes for agnos.json
+          echo "HASH_XZ=$(sha256sum output/boot.img.xz | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "HASH_RAW=$(sha256sum output/boot.img | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SIZE=$(stat -c%s output/boot.img.xz)" >> $GITHUB_ENV
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "AGNOS Kernel ${{ steps.version.outputs.version }}"
+          body: |
+            Custom AGNOS kernel build with Bluetooth support enabled for comma 3X devices.
+
+            ## Changes
+            - Enabled Bluetooth UART driver for SDM845
+            - Added btattach support for /dev/ttyHS0
+
+            ## Hashes (for agnos.json)
+            ```json
+            {
+              "name": "boot",
+              "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/boot.img.xz",
+              "hash": "${{ env.HASH_XZ }}",
+              "hash_raw": "${{ env.HASH_RAW }}",
+              "size": ${{ env.SIZE }},
+              "sparse": false,
+              "full_check": true,
+              "has_ab": true
+            }
+            ```
+
+            This release is used by sunnypilot branches that include Bluetooth gamepad support.
+          files: |
+            agnos-builder/output/boot.img.xz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
