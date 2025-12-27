@@ -90,7 +90,12 @@
   status = "ok";
 };
 
-/* Bluetooth UART */
+/* GPS UART - SE3 at 0x88c000 */
+&qupv3_gps_uart {
+  status = "ok";
+};
+
+/* Bluetooth UART - SE6 at 0x898000 */
 &qupv3_se6_4uart {
   status = "ok";
 };
